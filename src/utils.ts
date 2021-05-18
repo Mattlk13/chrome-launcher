@@ -7,8 +7,8 @@
 
 import {join} from 'path';
 import {execSync} from 'child_process';
-import * as mkdirp from 'mkdirp';
-const isWsl = require('is-wsl');
+import {mkdirSync} from 'fs';
+import isWsl = require('is-wsl');
 
 export const enum LaunchErrorCodes {
   ERR_LAUNCHER_PATH_NOT_SET = 'ERR_LAUNCHER_PATH_NOT_SET',
@@ -35,7 +35,7 @@ export class LauncherError extends Error {
 
 export class ChromePathNotSetError extends LauncherError {
   message =
-      'The environment variable CHROME_PATH must be set to executable of a build of Chromium version 54.0 or later.';
+      'The CHROME_PATH environment variable must be set to a Chrome/Chromium executable no older than Chrome stable.';
   code = LaunchErrorCodes.ERR_LAUNCHER_PATH_NOT_SET;
 }
 
@@ -101,6 +101,6 @@ function makeWin32TmpDir() {
   const randomNumber = Math.floor(Math.random() * 9e7 + 1e7);
   const tmpdir = join(winTmpPath, 'lighthouse.' + randomNumber);
 
-  mkdirp.sync(tmpdir);
+  mkdirSync(tmpdir, {recursive: true});
   return tmpdir;
 }

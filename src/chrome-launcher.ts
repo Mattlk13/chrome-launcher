@@ -8,7 +8,6 @@
 import * as childProcess from 'child_process';
 import * as fs from 'fs';
 import * as net from 'net';
-import * as rimraf from 'rimraf';
 import * as chromeFinder from './chrome-finder';
 import {getRandomPort} from './random-port';
 import {DEFAULT_FLAGS} from './flags';
@@ -26,8 +25,6 @@ const _SUPPORTED_PLATFORMS = new Set(['darwin', 'linux', 'win32', 'wsl']);
 type SupportedPlatforms = 'darwin'|'linux'|'win32'|'wsl';
 
 const instances = new Set<Launcher>();
-
-export type RimrafModule = (path: string, callback: (error: Error) => void) => void;
 
 export interface Options {
   startingUrl?: string;
@@ -47,12 +44,11 @@ export interface LaunchedChrome {
   pid: number;
   port: number;
   process: ChildProcess;
-  kill: () => Promise<{}>;
+  kill: () => Promise<void>;
 }
 
 export interface ModuleOverrides {
   fs?: typeof fs;
-  rimraf?: RimrafModule;
   spawn?: typeof childProcess.spawn;
 }
 
@@ -113,7 +109,6 @@ class Launcher {
   private connectionPollInterval: number;
   private maxConnectionRetries: number;
   private fs: typeof fs;
-  private rimraf: RimrafModule;
   private spawn: typeof childProcess.spawn;
   private useDefaultProfile: boolean;
   private envVars: {[key: string]: string|undefined};
@@ -125,7 +120,6 @@ class Launcher {
 
   constructor(private opts: Options = {}, moduleOverrides: ModuleOverrides = {}) {
     this.fs = moduleOverrides.fs || fs;
-    this.rimraf = moduleOverrides.rimraf || rimraf;
     this.spawn = moduleOverrides.spawn || spawn;
 
     log.setLevel(defaults(this.opts.logLevel, 'silent'));
@@ -177,6 +171,13 @@ class Launcher {
     return DEFAULT_FLAGS.slice();
   }
 
+  /** Returns the highest priority chrome installation. */
+  static getFirstInstallation() {
+    if (getPlatform() === 'darwin') return chromeFinder.darwinFast();
+    return chromeFinder[getPlatform() as SupportedPlatforms]()[0];
+  }
+
+  /** Returns all available chrome installations in decreasing priority order. */
   static getInstallations() {
     return chromeFinder[getPlatform() as SupportedPlatforms]();
   }
@@ -219,12 +220,12 @@ class Launcher {
       }
     }
     if (this.chromePath === undefined) {
-      const installations = Launcher.getInstallations();
-      if (installations.length === 0) {
+      const installation = Launcher.getFirstInstallation();
+      if (!installation) {
         throw new ChromeNotInstalledError();
       }
 
-      this.chromePath = installations[0];
+      this.chromePath = installation;
     }
 
     if (!this.tmpDirandPidFileReady) {
@@ -279,7 +280,7 @@ class Launcher {
   }
 
   // resolves if ready, rejects otherwise
-  private isDebuggerReady(): Promise<{}> {
+  private isDebuggerReady(): Promise<void> {
     return new Promise((resolve, reject) => {
       const client = net.createConnection(this.port!);
       client.once('error', err => {
@@ -297,7 +298,7 @@ class Launcher {
   waitUntilReady() {
     const launcher = this;
 
-    return new Promise((resolve, reject) => {
+    return new Promise<void>((resolve, reject) => {
       let retries = 0;
       let waitStatus = 'Waiting for browser.';
 
@@ -332,7 +333,7 @@ class Launcher {
   }
 
   kill() {
-    return new Promise<{}>((resolve, reject) => {
+    return new Promise<void>((resolve, reject) => {
       if (this.chrome) {
         this.chrome.on('close', () => {
           delete this.chrome;
@@ -361,7 +362,7 @@ class Launcher {
   }
 
   destroyTmp() {
-    return new Promise(resolve => {
+    return new Promise<void>(resolve => {
       // Only clean up the tmp dir if we created it.
       if (this.userDataDir === undefined || this.opts.userDataDir !== undefined) {
         return resolve();
@@ -377,7 +378,7 @@ class Launcher {
         delete this.errFile;
       }
 
-      this.rimraf(this.userDataDir, () => resolve());
+      this.fs.rmdir(this.userDataDir, {recursive: true}, () => resolve());
     });
   }
 };

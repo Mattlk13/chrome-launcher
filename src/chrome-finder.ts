@@ -5,10 +5,11 @@
  */
 'use strict';
 
-const fs = require('fs');
-const path = require('path');
-const execSync = require('child_process').execSync;
-const execFileSync = require('child_process').execFileSync;
+import fs = require('fs');
+import path = require('path');
+import {homedir} from 'os';
+import {execSync, execFileSync} from 'child_process';
+import escapeRegExp = require('escape-string-regexp');
 const log = require('lighthouse-logger');
 
 import {getLocalAppDataPath, ChromePathNotSetError} from './utils';
@@ -16,6 +17,24 @@ import {getLocalAppDataPath, ChromePathNotSetError} from './utils';
 const newLineRegex = /\r?\n/;
 
 type Priorities = Array<{regex: RegExp, weight: number}>;
+
+/**
+ * check for MacOS default app paths first to avoid waiting for the slow lsregister command
+ */
+export function darwinFast(): string|undefined {
+  const priorityOptions: Array<string|undefined> = [
+    process.env.CHROME_PATH,
+    process.env.LIGHTHOUSE_CHROMIUM_PATH,
+    '/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary',
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+  ];
+
+  for (const chromePath of priorityOptions) {
+    if (chromePath && canAccess(chromePath)) return chromePath;
+  }
+
+  return darwin()[0]
+}
 
 export function darwin() {
   const suffixes = ['/Contents/MacOS/Google Chrome Canary', '/Contents/MacOS/Google Chrome'];
@@ -33,7 +52,7 @@ export function darwin() {
 
   execSync(
       `${LSREGISTER} -dump` +
-      ' | grep -i \'google chrome\\( canary\\)\\?.app.*$\'' +
+      ' | grep -i \'google chrome\\( canary\\)\\?\\.app\'' +
       ' | awk \'{$1=""; print $0}\'')
       .toString()
       .split(newLineRegex)
@@ -46,11 +65,13 @@ export function darwin() {
         });
       });
 
+
   // Retains one per line to maintain readability.
   // clang-format off
+  const home = escapeRegExp(process.env.HOME || homedir());
   const priorities: Priorities = [
-    {regex: new RegExp(`^${process.env.HOME}/Applications/.*Chrome.app`), weight: 50},
-    {regex: new RegExp(`^${process.env.HOME}/Applications/.*Chrome Canary.app`), weight: 51},
+    {regex: new RegExp(`^${home}/Applications/.*Chrome\\.app`), weight: 50},
+    {regex: new RegExp(`^${home}/Applications/.*Chrome Canary\\.app`), weight: 51},
     {regex: /^\/Applications\/.*Chrome.app/, weight: 100},
     {regex: /^\/Applications\/.*Chrome Canary.app/, weight: 101},
     {regex: /^\/Volumes\/.*Chrome.app/, weight: -2},
@@ -58,11 +79,11 @@ export function darwin() {
   ];
 
   if (process.env.LIGHTHOUSE_CHROMIUM_PATH) {
-    priorities.unshift({regex: new RegExp(`${process.env.LIGHTHOUSE_CHROMIUM_PATH}`), weight: 150});
+    priorities.unshift({regex: new RegExp(escapeRegExp(process.env.LIGHTHOUSE_CHROMIUM_PATH)), weight: 150});
   }
 
   if (process.env.CHROME_PATH) {
-    priorities.unshift({regex: new RegExp(`${process.env.CHROME_PATH}`), weight: 151});
+    priorities.unshift({regex: new RegExp(escapeRegExp(process.env.CHROME_PATH)), weight: 151});
   }
 
   // clang-format on
@@ -70,11 +91,11 @@ export function darwin() {
 }
 
 function resolveChromePath() {
-  if (canAccess(`${process.env.CHROME_PATH}`)) {
+  if (canAccess(process.env.CHROME_PATH)) {
     return process.env.CHROME_PATH;
   }
 
-  if (canAccess(`${process.env.LIGHTHOUSE_CHROMIUM_PATH}`)) {
+  if (canAccess(process.env.LIGHTHOUSE_CHROMIUM_PATH)) {
     log.warn(
         'ChromeLauncher',
         'LIGHTHOUSE_CHROMIUM_PATH is deprecated, use CHROME_PATH env variable instead.');
@@ -101,7 +122,7 @@ export function linux() {
 
   // 2. Look into the directories where .desktop are saved on gnome based distro's
   const desktopInstallationFolders = [
-    path.join(require('os').homedir(), '.local/share/applications/'),
+    path.join(homedir(), '.local/share/applications/'),
     '/usr/share/applications/',
   ];
   desktopInstallationFolders.forEach(folder => {
@@ -141,11 +162,12 @@ export function linux() {
   ];
 
   if (process.env.LIGHTHOUSE_CHROMIUM_PATH) {
-    priorities.unshift({regex: new RegExp(`${process.env.LIGHTHOUSE_CHROMIUM_PATH}`), weight: 100});
+    priorities.unshift(
+        {regex: new RegExp(escapeRegExp(process.env.LIGHTHOUSE_CHROMIUM_PATH)), weight: 100});
   }
 
   if (process.env.CHROME_PATH) {
-    priorities.unshift({regex: new RegExp(`${process.env.CHROME_PATH}`), weight: 101});
+    priorities.unshift({regex: new RegExp(escapeRegExp(process.env.CHROME_PATH)), weight: 101});
   }
 
   return sort(uniq(installations.filter(Boolean)), priorities);
@@ -168,7 +190,7 @@ export function win32() {
   ];
   const prefixes = [
     process.env.LOCALAPPDATA, process.env.PROGRAMFILES, process.env['PROGRAMFILES(X86)']
-  ].filter(Boolean);
+  ].filter(Boolean) as string[];
 
   const customChromePath = resolveChromePath();
   if (customChromePath) {
@@ -202,7 +224,7 @@ function sort(installations: string[], priorities: Priorities) {
       .map(pair => pair.path);
 }
 
-function canAccess(file: string): Boolean {
+function canAccess(file: string|undefined): Boolean {
   if (!file) {
     return false;
   }

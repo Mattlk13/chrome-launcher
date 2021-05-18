@@ -15,14 +15,15 @@ const log = require('lighthouse-logger');
 const fsMock = {
   openSync: () => {},
   closeSync: () => {},
-  writeFileSync: () => {}
+  writeFileSync: () => {},
+  rmdir: () => {},
 };
 
 const launchChromeWithOpts = async (opts: Options = {}) => {
   const spawnStub = stub().returns({pid: 'some_pid'});
 
   const chromeInstance =
-      new Launcher(opts, {fs: fsMock as any, rimraf: spy() as any, spawn: spawnStub as any});
+      new Launcher(opts, {fs: fsMock as any, spawn: spawnStub as any});
   stub(chromeInstance, 'waitUntilReady').returns(Promise.resolve());
 
   chromeInstance.prepare();
@@ -53,31 +54,32 @@ describe('Launcher', () => {
   });
 
   it('accepts and uses a custom path', async () => {
-    const rimrafMock = spy();
+    const fs = {...fsMock, rmdir: spy()};
     const chromeInstance =
-        new Launcher({userDataDir: 'some_path'}, {fs: fsMock as any, rimraf: rimrafMock as any});
+        new Launcher({userDataDir: 'some_path'}, {fs: fs as any});
 
     chromeInstance.prepare();
 
     await chromeInstance.destroyTmp();
-    assert.strictEqual(rimrafMock.callCount, 0);
+    assert.strictEqual(fs.rmdir.callCount, 0);
   });
 
   it('cleans up the tmp dir after closing', async () => {
-    const rimrafMock = stub().callsFake((_, done) => done());
+    const rmdirMock = stub().callsFake((_path, _options, done) => done());
+    const fs = {...fsMock, rmdir: rmdirMock};
 
-    const chromeInstance = new Launcher({}, {fs: fsMock as any, rimraf: rimrafMock as any});
+    const chromeInstance = new Launcher({}, {fs: fs as any});
 
     chromeInstance.prepare();
     await chromeInstance.destroyTmp();
-    assert.strictEqual(rimrafMock.callCount, 1);
+    assert.strictEqual(fs.rmdir.callCount, 1);
   });
 
   it('does not delete created directory when custom path passed', () => {
     const chromeInstance = new Launcher({userDataDir: 'some_path'}, {fs: fsMock as any});
 
     chromeInstance.prepare();
-    assert.equal(chromeInstance.userDataDir, 'some_path');
+    assert.strictEqual(chromeInstance.userDataDir, 'some_path');
   });
 
   it('defaults to genering a tmp dir when no data dir is passed', () => {
@@ -85,7 +87,7 @@ describe('Launcher', () => {
     const originalMakeTmp = chromeInstance.makeTmpDir;
     chromeInstance.makeTmpDir = () => 'tmp_dir'
     chromeInstance.prepare()
-    assert.equal(chromeInstance.userDataDir, 'tmp_dir');
+    assert.strictEqual(chromeInstance.userDataDir, 'tmp_dir');
 
     // Restore the original fn.
     chromeInstance.makeTmpDir = originalMakeTmp;
@@ -96,7 +98,7 @@ describe('Launcher', () => {
     await chromeInstance.launch();
     await chromeInstance.kill();
     await chromeInstance.kill();
-  });
+  }).timeout(30 * 1000);
 
   it('doesn\'t fail when killing all instances', async () => {
     await launch();
@@ -144,7 +146,7 @@ describe('Launcher', () => {
     const installations = Launcher.getInstallations();
     assert.ok(Array.isArray(installations));
     assert.ok(installations.length >= 1);
-  });
+  }).timeout(30_000);
 
   it('removes --user-data-dir if userDataDir is false', async () => {
     const spawnStub = await launchChromeWithOpts();
@@ -155,14 +157,14 @@ describe('Launcher', () => {
   it('passes no env vars when none are passed', async () => {
     const spawnStub = await launchChromeWithOpts();
     const spawnOptions = spawnStub.getCall(0).args[2] as {env: {}};
-    assert.deepEqual(spawnOptions.env, Object.assign({}, process.env));
+    assert.deepStrictEqual(spawnOptions.env, Object.assign({}, process.env));
   });
 
   it('passes env vars when passed', async () => {
     const envVars = {'hello': 'world'};
     const spawnStub = await launchChromeWithOpts({envVars});
     const spawnOptions = spawnStub.getCall(0).args[2] as {env: {}};
-    assert.deepEqual(spawnOptions.env, envVars);
+    assert.deepStrictEqual(spawnOptions.env, envVars);
   });
 
   it('ensure specific flags are present when passed and defaults are ignored', async () => {
