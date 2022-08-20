@@ -8,15 +8,13 @@
 import * as childProcess from 'child_process';
 import * as fs from 'fs';
 import * as net from 'net';
-import * as rimraf from 'rimraf';
 import * as chromeFinder from './chrome-finder';
 import {getRandomPort} from './random-port';
 import {DEFAULT_FLAGS} from './flags';
-import {makeTmpDir, defaults, delay, getPlatform, toWinDirFormat, InvalidUserDataDirectoryError, UnsupportedPlatformError, ChromeNotInstalledError} from './utils';
+import {makeTmpDir, defaults, delay, getPlatform, toWin32Path, InvalidUserDataDirectoryError, UnsupportedPlatformError, ChromeNotInstalledError} from './utils';
 import {ChildProcess} from 'child_process';
+import {spawn, spawnSync} from 'child_process';
 const log = require('lighthouse-logger');
-const spawn = childProcess.spawn;
-const execSync = childProcess.execSync;
 const isWsl = getPlatform() === 'wsl';
 const isWindows = getPlatform() === 'win32';
 const _SIGINT = 'SIGINT';
@@ -27,11 +25,12 @@ type SupportedPlatforms = 'darwin'|'linux'|'win32'|'wsl';
 
 const instances = new Set<Launcher>();
 
-export type RimrafModule = (path: string, callback: (error: Error) => void) => void;
+type JSONLike =|{[property: string]: JSONLike}|readonly JSONLike[]|string|number|boolean|null;
 
 export interface Options {
   startingUrl?: string;
   chromeFlags?: Array<string>;
+  prefs?: Record<string, JSONLike>;
   port?: number;
   handleSIGINT?: boolean;
   chromePath?: string;
@@ -47,17 +46,16 @@ export interface LaunchedChrome {
   pid: number;
   port: number;
   process: ChildProcess;
-  kill: () => Promise<{}>;
+  kill: () => void;
 }
 
 export interface ModuleOverrides {
   fs?: typeof fs;
-  rimraf?: RimrafModule;
   spawn?: typeof childProcess.spawn;
 }
 
-const sigintListener = async () => {
-  await killAll();
+const sigintListener = () => {
+  killAll();
   process.exit(_SIGINT_EXIT_CODE);
 };
 
@@ -74,22 +72,31 @@ async function launch(opts: Options = {}): Promise<LaunchedChrome> {
 
   await instance.launch();
 
-  const kill = async () => {
+  const kill = () => {
     instances.delete(instance);
     if (instances.size === 0) {
       process.removeListener(_SIGINT, sigintListener);
     }
-    return instance.kill();
+    instance.kill();
   };
 
-  return {pid: instance.pid!, port: instance.port!, kill, process: instance.chrome!};
+  return {pid: instance.pid!, port: instance.port!, kill, process: instance.chromeProcess!};
 }
 
-async function killAll(): Promise<Array<Error>> {
+/** Returns Chrome installation path that chrome-launcher will launch by default. */
+function getChromePath(): string {
+  const installation = Launcher.getFirstInstallation();
+  if (!installation) {
+    throw new ChromeNotInstalledError();
+  }
+  return installation;
+}
+
+function killAll(): Array<Error> {
   let errors = [];
   for (const instance of instances) {
     try {
-      await instance.kill();
+      instance.kill();
       // only delete if kill did not error
       // this means erroring instances remain in the Set
       instances.delete(instance);
@@ -109,23 +116,22 @@ class Launcher {
   private chromePath?: string;
   private ignoreDefaultFlags?: boolean;
   private chromeFlags: string[];
+  private prefs: Record<string, JSONLike>;
   private requestedPort?: number;
   private connectionPollInterval: number;
   private maxConnectionRetries: number;
   private fs: typeof fs;
-  private rimraf: RimrafModule;
   private spawn: typeof childProcess.spawn;
   private useDefaultProfile: boolean;
   private envVars: {[key: string]: string|undefined};
 
-  chrome?: childProcess.ChildProcess;
+  chromeProcess?: childProcess.ChildProcess;
   userDataDir?: string;
   port?: number;
   pid?: number;
 
   constructor(private opts: Options = {}, moduleOverrides: ModuleOverrides = {}) {
     this.fs = moduleOverrides.fs || fs;
-    this.rimraf = moduleOverrides.rimraf || rimraf;
     this.spawn = moduleOverrides.spawn || spawn;
 
     log.setLevel(defaults(this.opts.logLevel, 'silent'));
@@ -133,6 +139,7 @@ class Launcher {
     // choose the first one (default)
     this.startingUrl = defaults(this.opts.startingUrl, 'about:blank');
     this.chromeFlags = defaults(this.opts.chromeFlags, []);
+    this.prefs = defaults(this.opts.prefs, {});
     this.requestedPort = defaults(this.opts.port, 0);
     this.chromePath = this.opts.chromePath;
     this.ignoreDefaultFlags = defaults(this.opts.ignoreDefaultFlags, false);
@@ -164,8 +171,10 @@ class Launcher {
     if (!this.useDefaultProfile) {
       // Place Chrome profile in a custom location we'll rm -rf later
       // If in WSL, we need to use the Windows format
-      flags.push(`--user-data-dir=${isWsl ? toWinDirFormat(this.userDataDir) : this.userDataDir}`);
+      flags.push(`--user-data-dir=${isWsl ? toWin32Path(this.userDataDir) : this.userDataDir}`);
     }
+
+    if (process.env.HEADLESS) flags.push('--headless');
 
     flags.push(...this.chromeFlags);
     flags.push(this.startingUrl);
@@ -177,6 +186,13 @@ class Launcher {
     return DEFAULT_FLAGS.slice();
   }
 
+  /** Returns the highest priority chrome installation. */
+  static getFirstInstallation() {
+    if (getPlatform() === 'darwin') return chromeFinder.darwinFast();
+    return chromeFinder[getPlatform() as SupportedPlatforms]()[0];
+  }
+
+  /** Returns all available chrome installations in decreasing priority order. */
   static getInstallations() {
     return chromeFinder[getPlatform() as SupportedPlatforms]();
   }
@@ -196,6 +212,8 @@ class Launcher {
     this.outFile = this.fs.openSync(`${this.userDataDir}/chrome-out.log`, 'a');
     this.errFile = this.fs.openSync(`${this.userDataDir}/chrome-err.log`, 'a');
 
+    this.setBrowserPrefs();
+
     // fix for Node4
     // you can't pass a fd to fs.writeFileSync
     this.pidFile = `${this.userDataDir}/chrome.pid`;
@@ -203,6 +221,28 @@ class Launcher {
     log.verbose('ChromeLauncher', `created ${this.userDataDir}`);
 
     this.tmpDirandPidFileReady = true;
+  }
+
+  private setBrowserPrefs() {
+    // don't set prefs if not defined
+    if (Object.keys(this.prefs).length === 0) {
+      return;
+    }
+
+    const preferenceFile = `${this.userDataDir}/Preferences`;
+    try {
+      if (this.fs.existsSync(preferenceFile)) {
+        // overwrite existing file
+        const file = this.fs.readFileSync(preferenceFile, 'utf-8');
+        const content = JSON.parse(file);
+        this.fs.writeFileSync(preferenceFile, JSON.stringify({...content, ...this.prefs}), 'utf-8');
+      } else {
+        // create new Preference file
+        this.fs.writeFileSync(preferenceFile, JSON.stringify({...this.prefs}), 'utf-8');
+      }
+    } catch (err) {
+      log.log('ChromeLauncher', `Failed to set browser prefs: ${err.message}`);
+    }
   }
 
   async launch() {
@@ -219,12 +259,12 @@ class Launcher {
       }
     }
     if (this.chromePath === undefined) {
-      const installations = Launcher.getInstallations();
-      if (installations.length === 0) {
+      const installation = Launcher.getFirstInstallation();
+      if (!installation) {
         throw new ChromeNotInstalledError();
       }
 
-      this.chromePath = installations[0];
+      this.chromePath = installation;
     }
 
     if (!this.tmpDirandPidFileReady) {
@@ -237,9 +277,9 @@ class Launcher {
 
   private async spawnProcess(execPath: string) {
     const spawnPromise = (async () => {
-      if (this.chrome) {
-        log.log('ChromeLauncher', `Chrome already running with pid ${this.chrome.pid}.`);
-        return this.chrome.pid;
+      if (this.chromeProcess) {
+        log.log('ChromeLauncher', `Chrome already running with pid ${this.chromeProcess.pid}.`);
+        return this.chromeProcess.pid;
       }
 
 
@@ -253,15 +293,23 @@ class Launcher {
 
       log.verbose(
           'ChromeLauncher', `Launching with command:\n"${execPath}" ${this.flags.join(' ')}`);
-      const chrome = this.spawn(
-          execPath, this.flags,
-          {detached: true, stdio: ['ignore', this.outFile, this.errFile], env: this.envVars});
-      this.chrome = chrome;
+      this.chromeProcess = this.spawn(execPath, this.flags, {
+        // On non-windows platforms, `detached: true` makes child process a leader of a new
+        // process group, making it possible to kill child process tree with `.kill(-pid)` command.
+        // @see https://nodejs.org/api/child_process.html#child_process_options_detached
+        detached: process.platform !== 'win32',
+        stdio: ['ignore', this.outFile, this.errFile],
+        env: this.envVars
+      });
 
-      this.fs.writeFileSync(this.pidFile, chrome.pid.toString());
+      if (this.chromeProcess.pid) {
+        this.fs.writeFileSync(this.pidFile, this.chromeProcess.pid.toString());
+      }
 
-      log.verbose('ChromeLauncher', `Chrome running with pid ${chrome.pid} on port ${this.port}.`);
-      return chrome.pid;
+      log.verbose(
+          'ChromeLauncher',
+          `Chrome running with pid ${this.chromeProcess.pid} on port ${this.port}.`);
+      return this.chromeProcess.pid;
     })();
 
     const pid = await spawnPromise;
@@ -279,9 +327,9 @@ class Launcher {
   }
 
   // resolves if ready, rejects otherwise
-  private isDebuggerReady(): Promise<{}> {
+  private isDebuggerReady(): Promise<void> {
     return new Promise((resolve, reject) => {
-      const client = net.createConnection(this.port!);
+      const client = net.createConnection(this.port!, '127.0.0.1');
       client.once('error', err => {
         this.cleanup(client);
         reject(err);
@@ -297,7 +345,7 @@ class Launcher {
   waitUntilReady() {
     const launcher = this;
 
-    return new Promise((resolve, reject) => {
+    return new Promise<void>((resolve, reject) => {
       let retries = 0;
       let waitStatus = 'Waiting for browser.';
 
@@ -332,55 +380,58 @@ class Launcher {
   }
 
   kill() {
-    return new Promise<{}>((resolve, reject) => {
-      if (this.chrome) {
-        this.chrome.on('close', () => {
-          delete this.chrome;
-          this.destroyTmp().then(resolve);
-        });
+    if (!this.chromeProcess) {
+      return;
+    }
 
-        log.log('ChromeLauncher', `Killing Chrome instance ${this.chrome.pid}`);
-        try {
-          if (isWindows) {
-            // While pipe is the default, stderr also gets printed to process.stderr
-            // if you don't explicitly set `stdio`
-            execSync(`taskkill /pid ${this.chrome.pid} /T /F`, {stdio: 'pipe'});
-          } else {
-            process.kill(-this.chrome.pid);
-          }
-        } catch (err) {
-          const message = `Chrome could not be killed ${err.message}`;
-          log.warn('ChromeLauncher', message);
-          reject(new Error(message));
-        }
-      } else {
-        // fail silently as we did not start chrome
-        resolve();
-      }
+    this.chromeProcess.on('close', () => {
+      delete this.chromeProcess;
+      this.destroyTmp();
     });
+
+    log.log('ChromeLauncher', `Killing Chrome instance ${this.chromeProcess.pid}`);
+    try {
+      if (isWindows) {
+        // https://github.com/GoogleChrome/chrome-launcher/issues/266
+        const taskkillProc = spawnSync(
+            `taskkill /pid ${this.chromeProcess.pid} /T /F`, {shell: true, encoding: 'utf-8'});
+
+        const {stderr} = taskkillProc;
+        if (stderr) log.error('ChromeLauncher', `taskkill stderr`, stderr);
+      } else {
+        if (this.chromeProcess.pid) {
+          process.kill(-this.chromeProcess.pid, 'SIGKILL');
+        }
+      }
+    } catch (err) {
+      const message = `Chrome could not be killed ${err.message}`;
+      log.warn('ChromeLauncher', message);
+    }
+    this.destroyTmp();
   }
 
   destroyTmp() {
-    return new Promise(resolve => {
-      // Only clean up the tmp dir if we created it.
-      if (this.userDataDir === undefined || this.opts.userDataDir !== undefined) {
-        return resolve();
-      }
+    // Only clean up the tmp dir if we created it.
+    if (this.userDataDir === undefined || this.opts.userDataDir !== undefined) {
+      return;
+    }
 
-      if (this.outFile) {
-        this.fs.closeSync(this.outFile);
-        delete this.outFile;
-      }
+    if (this.outFile) {
+      this.fs.closeSync(this.outFile);
+      delete this.outFile;
+    }
 
-      if (this.errFile) {
-        this.fs.closeSync(this.errFile);
-        delete this.errFile;
-      }
+    if (this.errFile) {
+      this.fs.closeSync(this.errFile);
+      delete this.errFile;
+    }
 
-      this.rimraf(this.userDataDir, () => resolve());
-    });
+    // backwards support for node v12 + v14.14+
+    // https://nodejs.org/api/deprecations.html#DEP0147
+    const rmSync = this.fs.rmSync || this.fs.rmdirSync;
+    rmSync(this.userDataDir, {recursive: true, force: true, maxRetries: 10});
   }
 };
 
 export default Launcher;
-export {Launcher, launch, killAll};
+export {Launcher, launch, killAll, getChromePath};
